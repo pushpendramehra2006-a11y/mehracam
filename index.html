@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MehraCam</title>
+<style>
+:root{--bg:#f6f7fb;--card:#fff;--text:#14161f;--muted:#5d6477;--accent:#e5484d;--line:#dfe3ee}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1117;--card:#181b25;--text:#f1f3f9;--muted:#9aa2b8;--line:#2a2f3f}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px;padding-top:max(16px,env(safe-area-inset-top));padding-bottom:max(16px,env(safe-area-inset-bottom))}
+.wrap{max-width:820px;margin:0 auto}
+h1{font-size:26px;margin:4px 0 2px}
+h1 span{color:var(--accent)}
+p.sub{margin:0 0 14px;color:var(--muted);font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px;margin-bottom:14px}
+.stage{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;touch-action:none;cursor:ew-resize}
+video{width:100%;height:100%;object-fit:contain;display:block}
+.crop{position:absolute;top:0;bottom:0;border:2px solid var(--accent);box-shadow:0 0 0 999px rgba(0,0,0,.55);pointer-events:none}
+.tag{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.6);color:#fff;font-size:12px;padding:3px 8px;border-radius:999px}
+.rec{position:absolute;top:8px;right:8px;background:var(--accent);color:#fff;font-size:12px;padding:3px 8px;border-radius:999px;display:none}
+.rec.on{display:block}
+.row{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;align-items:center}
+button,select{padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;font-weight:600;cursor:pointer}
+button{flex:1;min-width:130px}
+button.main{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+label{font-size:13px;color:var(--muted);display:block;margin-top:12px}
+input[type=range]{width:100%}
+#info{margin-top:10px;font-size:13px;color:var(--muted);min-height:18px}
+.out{display:none;grid-template-columns:1fr 1fr;gap:12px}
+.out.show{display:grid}
+.out video{background:#000;border-radius:10px;width:100%;max-height:360px}
+.out a{display:block;text-align:center;margin-top:8px;padding:11px;border-radius:12px;background:var(--accent);color:#fff;text-decoration:none;font-weight:600;font-size:14px}
+@media (max-width:560px){.out{grid-template-columns:1fr}}
+canvas{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Mehra<span>Cam</span></h1>
+  <p class="sub">Ek hi recording me Horizontal (16:9) aur Vertical (9:16) dono videos</p>
+
+  <div class="card">
+    <div class="stage" id="stage">
+      <video id="v" autoplay playsinline muted></video>
+      <div class="crop" id="crop"></div>
+      <div class="tag">Lal frame = Vertical 9:16 (drag karo)</div>
+      <div class="rec" id="recTag">● REC <span id="timer">00:00</span></div>
+    </div>
+
+    <label for="pos">Vertical frame ki position (left ↔ right)</label>
+    <input type="range" id="pos" min="0" max="100" value="50">
+
+    <div class="row">
+      <select id="q" aria-label="Quality">
+        <option value="best">Best quality (bhaari)</option>
+        <option value="1080" selected>1080p (halka, safe)</option>
+      </select>
+      <button id="flip" disabled>Front/Back</button>
+    </div>
+    <div class="row">
+      <button id="start" class="main">Camera chalu karo</button>
+      <button id="rec" class="main" disabled>Record shuru</button>
+    </div>
+    <div id="info"></div>
+  </div>
+
+  <div class="card out" id="out">
+    <div>
+      <strong>Horizontal 16:9</strong>
+      <video id="vh" controls playsinline></video>
+      <a id="dh" download>Horizontal download</a>
+    </div>
+    <div>
+      <strong>Vertical 9:16</strong>
+      <video id="vv" controls playsinline></video>
+      <a id="dv" download>Vertical download</a>
+    </div>
+  </div>
+</div>
+
+<canvas id="ch"></canvas>
+<canvas id="cv"></canvas>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('v'), stage = $('stage'), crop = $('crop'), info = $('info');
+const ch = $('ch'), cv = $('cv');
+const cxh = ch.getContext('2d'), cxv = cv.getContext('2d');
+const even = n => Math.max(2, Math.round(n / 2) * 2);
+
+let camStream = null, facing = 'environment', cropX = 0.5;
+let vw = 0, vh = 0, g = null;           // source size + crop geometry
+let looping = false, recorders = [], chunks = { h: [], v: [] };
+let timerId = null, t0 = 0, mime = '';
+
+/* ---------- Step 1: camera ---------- */
+async function openCamera() {
+  try {
+    if (camStream) camStream.getTracks().forEach(t => t.stop());
+    const base = { facingMode: facing, width: { ideal: 3840 }, height: { ideal: 2160 } };
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: base, audio: true });
+    } catch (e) {
+      // mic nahi mila to bina audio chalao
+      camStream = await navigator.mediaDevices.getUserMedia({ video: base, audio: false });
+      info.textContent = 'Mic allow nahi hua, video bina awaaz ke record hoga.';
+    }
+    video.srcObject = camStream;
+    video.onloadedmetadata = () => { setupGeometry(); startLoop(); };
+    $('start').textContent = 'Camera chalu hai';
+    $('flip').disabled = false;
+    $('rec').disabled = false;
+  } catch (e) {
+    info.textContent = 'Camera nahi khula: ' + e.message + ' (HTTPS par kholo aur permission allow karo)';
+  }
+}
+
+/* ---------- Step 2: geometry + two canvases ---------- */
+function setupGeometry() {
+  vw = video.videoWidth; vh = video.videoHeight;
+  stage.style.aspectRatio = vw + '/' + vh;
+  const scale = $('q').value === '1080' ? Math.min(1, 1080 / vh) : 1;
+
+  // Horizontal 16:9 region (centered)
+  const hw = Math.min(vw, vh * 16 / 9), hh = hw * 9 / 16;
+  // Vertical 9:16 region (full height, x moves)
+  const vwid = vh * 9 / 16;
+
+  g = {
+    hx: (vw - hw) / 2, hy: (vh - hh) / 2, hw, hh,
+    vwid,
+    cropPct: vwid / vw * 100
+  };
+  ch.width = even(hw * scale);  ch.height = even(hh * scale);
+  cv.width = even(vwid * scale); cv.height = even(vh * scale);
+
+  crop.style.width = g.cropPct + '%';
+  updateCrop();
+  info.textContent = 'Camera: ' + vw + '×' + vh +
+    ' | Horizontal: ' + ch.width + '×' + ch.height +
+    ' | Vertical: ' + cv.width + '×' + cv.height;
+}
+
+function updateCrop() {
+  if (!g) return;
+  crop.style.left = (cropX * (100 - g.cropPct)) + '%';
+  $('pos').value = Math.round(cropX * 100);
+}
+
+function drawFrame() {
+  if (!looping) return;
+  if (video.readyState >= 2 && g) {
+    cxh.drawImage(video, g.hx, g.hy, g.hw, g.hh, 0, 0, ch.width, ch.height);
+    const sx = cropX * (vw - g.vwid);
+    cxv.drawImage(video, sx, 0, g.vwid, vh, 0, 0, cv.width, cv.height);
+  }
+  schedule();
+}
+function schedule() {
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(drawFrame);
+  else requestAnimationFrame(drawFrame);
+}
+function startLoop() { if (!looping) { looping = true; schedule(); } }
+
+/* vertical frame ko hilana: slider + drag */
+$('pos').oninput = e => { cropX = e.target.value / 100; updateCrop(); };
+function dragTo(clientX) {
+  if (!g) return;
+  const r = stage.getBoundingClientRect();
+  const centerPct = (clientX - r.left) / r.width * 100;
+  const leftPct = centerPct - g.cropPct / 2;
+  cropX = Math.min(1, Math.max(0, leftPct / (100 - g.cropPct)));
+  updateCrop();
+}
+let dragging = false;
+stage.addEventListener('pointerdown', e => { dragging = true; stage.setPointerCapture(e.pointerId); dragTo(e.clientX); });
+stage.addEventListener('pointermove', e => { if (dragging) dragTo(e.clientX); });
+stage.addEventListener('pointerup', () => dragging = false);
+
+/* ---------- Step 3 + 4: dono ek saath record (audio ke saath) ---------- */
+function pickMime() {
+  const list = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  return list.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+}
+
+function makeRecorder(canvas, key, bps) {
+  const s = canvas.captureStream(30);
+  const a = camStream.getAudioTracks()[0];
+  if (a) s.addTrack(a.clone());
+  const opts = { videoBitsPerSecond: bps };
+  if (mime) opts.mimeType = mime;
+  const r = new MediaRecorder(s, opts);
+  r.ondataavailable = e => { if (e.data && e.data.size) chunks[key].push(e.data); };
+  r.stopped = new Promise(res => r.onstop = res);
+  r.start(1000);
+  return r;
+}
+
+function startRecording() {
+  mime = pickMime();
+  chunks = { h: [], v: [] };
+  recorders = [makeRecorder(ch, 'h', 12e6), makeRecorder(cv, 'v', 8e6)];
+  $('out').classList.remove('show');
+  $('rec').textContent = 'Record roko';
+  $('flip').disabled = true; $('q').disabled = true;
+  $('recTag').classList.add('on');
+  t0 = Date.now();
+  timerId = setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    $('timer').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }, 500);
+}
+
+async function stopRecording() {
+  recorders.forEach(r => r.state !== 'inactive' && r.stop());
+  await Promise.all(recorders.map(r => r.stopped));
+  clearInterval(timerId);
+  $('recTag').classList.remove('on');
+  $('rec').textContent = 'Record shuru';
+  $('flip').disabled = false; $('q').disabled = false;
+  showResults();
+}
+
+$('rec').onclick = () => {
+  if (recorders.length && recorders[0].state === 'recording') stopRecording();
+  else startRecording();
+};
+
+/* ---------- Step 5: download ---------- */
+function showResults() {
+  const type = (mime || 'video/webm').split(';')[0];
+  const ext = type.includes('mp4') ? 'mp4' : 'webm';
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  [['h', 'vh', 'dh', 'horizontal'], ['v', 'vv', 'dv', 'vertical']].forEach(([k, vid, dl, name]) => {
+    const blob = new Blob(chunks[k], { type });
+    const url = URL.createObjectURL(blob);
+    $(vid).src = url;
+    $(dl).href = url;
+    $(dl).download = 'mehracam-' + name + '-' + stamp + '.' + ext;
+  });
+  $('out').classList.add('show');
+  $('out').scrollIntoView({ behavior: 'smooth' });
+}
+
+$('start').onclick = openCamera;
+$('flip').onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; openCamera(); };
+$('q').onchange = () => { if (vw) setupGeometry(); };
+</script>
+</body>
+</html>
